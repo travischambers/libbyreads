@@ -2,6 +2,7 @@
 import atexit
 import csv
 import multiprocessing
+import re
 import threading
 import urllib.parse
 from enum import Enum
@@ -22,28 +23,22 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
+
 MOVE_ON_WHEN_BOOK_FOUND = False
-NUM_THREADS = 32
+NUM_THREADS = 16
 
 
 class Driver:
     def __init__(self):
         # Normal Browser
-        # self.driver = webdriver.Chrome(
-        #     service=Service(ChromeDriverManager().install()),
-        # )
+        # self.driver = webdriver.Chrome()
 
-        # Headless
+        # Headless Browser
         options = webdriver.ChromeOptions()
         options.headless = True
         self.driver = webdriver.Chrome(
-            service=Service(ChromeDriverManager().install()),
             options=options
         )
-
-
-    def __del__(self):
-        self.driver.quit() # clean up driver when we are cleaned up
 
 
 threadLocal = threading.local()
@@ -68,10 +63,12 @@ class SearchRow(BaseModel):
     lib_name: str
     search_url: str
     title: str
+    author: str
 
 
 class SearchResult(BaseModel):
     title: str
+    author: str
     lib_name: str
     avail: str
     audiobook: str
@@ -90,7 +87,7 @@ def parse_want_to_read_from_goodreads_export() -> List[Dict]:
     """
     all_books = []
     want_to_read = []
-    with open("goodreads_library_export.csv", "r") as goodreads_export_csv:
+    with open("goodreads_library_export-11-27-2022.csv", "r") as goodreads_export_csv:
         reader = csv.DictReader(goodreads_export_csv)
         all_books = list(reader)
         for row in all_books:
@@ -123,6 +120,7 @@ def find_book_at_lib(search_row):
     
     return SearchResult(
         title=search_row.title,
+        author=search_row.author,
         lib_name=search_row.lib_name,
         avail=avail,
         audiobook=audiobook,
@@ -131,9 +129,23 @@ def find_book_at_lib(search_row):
     )
 
 
+def simplify_title(title) -> str:
+    """Simplify a title by removing anything after the ':' or in '()'
+    
+    Goodreads titles can sometimes be overly specific. This simplification leads to more success 
+    when searching titles in goodreads.
+
+    E.g.
+      	Going Postal (Discworld, #33; Moist von Lipwig, #1) --> Going Postal
+        Something Wicked This Way Comes (Green Town, #2) --> Something Wicket This Way Comes
+        The First 90 Days: Critical Success Strategies for New Leaders at All Levels --> The First 90 Days
+    """
+    return re.split(":|\(", title)[0].strip()
+
+
+
 def main():
     """Search your Libby libraries for books on your Goodreads want-to-read shelf."""
-    
     # These lib URLs can be discovered by going to https://libbyapp.com/interview/menu#mainMenu
     # and clicking on your library. Your browser will make a request like:
     # https://ntc.api.overdrive.com/v1/provider-subscriptions?libraryKey=utahsonlinelibrary-provo&x-client-id=dewey
@@ -142,29 +154,35 @@ def main():
     libs = {
         "hawaii": "https://libbyapp.com/library/hawaii",
         "utah": "https://libbyapp.com/library/beehive",
-        "idaho falls": "https://libbyapp.com/library/ifpl",
+        # "idaho falls": "https://libbyapp.com/library/ifpl",
         "livermore": "https://libbyapp.com/library/livermore",
     }
 
     want_to_read = parse_want_to_read_from_goodreads_export()
+    for book in want_to_read:
+        book["Title"] = simplify_title(book["Title"])
 
-    want_to_read_titles = [book["Title"] for book in want_to_read]
-    total_books = len(want_to_read_titles)
+    total_books = len(want_to_read)
+    total_libs = len(libs.keys())
 
     print(f"Number of to-read titles: {total_books}")
-    print(f"Number of libraries: {len(libs.keys())}")
+    print(f"Number of libraries: {total_libs}")
     print(f"Using {NUM_THREADS} threads")
     search_rows = []
-    for title in want_to_read_titles:
+    for book in want_to_read:
+        title = book["Title"]
+        author = book["Author"]
+        query = f"{title} {author}"
+        url_safe_query = urllib.parse.quote(query)
         for lib_name, lib_url in libs.items():
-            url_safe_title = urllib.parse.quote(title)
-            search_url = f"{lib_url}/search/query-{url_safe_title}/page-1"
-            search_rows.append(SearchRow(lib_name=lib_name, search_url=search_url, title=title))
+            search_url = f"{lib_url}/search/query-{url_safe_query}/page-1"
+            search_row = SearchRow(lib_name=lib_name, search_url=search_url, title=title, author=author)
+            search_rows.append(search_row)
 
     pool = ThreadPool(processes=NUM_THREADS)
 
     with Progress() as progress:
-        task_progress = progress.add_task(f"[green]Searching {len(libs.keys())} libraries for {total_books} books...", total=len(search_rows))
+        task_progress = progress.add_task(f"[green]Searching {total_libs} libraries for {total_books} books...", total=len(search_rows))
         results = []
         requests_finished = 0
         for result in pool.imap(find_book_at_lib, search_rows):
@@ -178,7 +196,7 @@ def main():
 
     with open("results.csv", "w") as csvfile:
         csvwriter = csv.writer(csvfile)
-        csvwriter.writerow(["Title", "Library Name", "Availability", "Audiobook", "Ebook", "Search URL"])
+        csvwriter.writerow(["Title", "Author", "Library Name", "Availability", "Audiobook", "Ebook", "Search URL"])
         for result in results:
             csvwriter.writerow(result.to_csv_row())
 
